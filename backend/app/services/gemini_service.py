@@ -138,45 +138,62 @@ CRITICAL RULES:
         has_image = bool(image_bytes and image_mime_type)
         prompt = self.build_prompt(module, budget, preferences, candidates, has_image=has_image)
 
-        try:
-            client = self._get_client()
-            config = types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.2,  # Low temperature for deterministic adherence to catalog
-            )
+        client = self._get_client()
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.2,  # Low temperature for deterministic adherence to catalog
+        )
 
-            contents: Any = prompt
-            if has_image:
-                contents = [
-                    prompt,
-                    types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type),
-                ]
+        contents: Any = prompt
+        if has_image:
+            contents = [
+                prompt,
+                types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type),
+            ]
 
-            response = client.models.generate_content(
-                model=self.model_name,
-                contents=contents,
-                config=config,
-            )
+        models_to_try = [self.model_name]
+        for fallback in ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]:
+            if fallback not in models_to_try:
+                models_to_try.append(fallback)
 
+        for model in models_to_try:
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
 
-            raw_text = response.text
-            if not raw_text or not raw_text.strip():
-                logger.warning("Gemini returned empty response text.")
-                return None
+                raw_text = response.text
+                if not raw_text or not raw_text.strip():
+                    logger.warning(f"Gemini model {model} returned empty response text.")
+                    continue
 
-            # Parse JSON
-            data = json.loads(raw_text)
+                cleaned_text = raw_text.strip()
+                if cleaned_text.startswith("```json"):
+                    cleaned_text = cleaned_text[7:]
+                if cleaned_text.startswith("```"):
+                    cleaned_text = cleaned_text[3:]
+                if cleaned_text.endswith("```"):
+                    cleaned_text = cleaned_text[:-3]
+                cleaned_text = cleaned_text.strip()
 
-            # Validate with Pydantic
-            structured_output = GeminiStructuredResponse.model_validate(data)
-            return structured_output
+                # Parse JSON
+                data = json.loads(cleaned_text)
 
-        except json.JSONDecodeError as jde:
-            logger.warning(f"Failed to decode Gemini JSON response: {jde}")
-            return None
-        except Exception as e:
-            logger.warning(f"Gemini API request failed: {e}")
-            return None
+                # Validate with Pydantic
+                structured_output = GeminiStructuredResponse.model_validate(data)
+                return structured_output
+
+            except json.JSONDecodeError as jde:
+                logger.warning(f"Failed to decode Gemini JSON response with model {model}: {jde}")
+                continue
+            except Exception as e:
+                logger.warning(f"Gemini API request failed with model {model}: {e}")
+                continue
+
+        logger.warning("All Gemini models failed or unavailable; using deterministic fallback.")
+        return None
 
 
 gemini_service = GeminiService()
